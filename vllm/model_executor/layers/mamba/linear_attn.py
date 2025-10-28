@@ -44,6 +44,44 @@ if TYPE_CHECKING:
 import torch
 import torch.distributed
 
+import pprint
+import numpy as np
+
+def print_tensor_stats(tensor, name):
+    """Prints statistics of a PyTorch tensor, mimicking the FD format."""
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    # ... (完整的 print_tensor_stats 函数实现，和你之前用的一样)
+    if tensor is None:
+        print(f"DEBUG_vLLM_INTERNAL: {name} is None")
+        return
+    with torch.no_grad():
+        stats = {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+        if tensor.numel() > 0:
+            tensor_cpu_float = tensor.detach().cpu().to(torch.float32)
+            
+            has_nan = torch.any(torch.isnan(tensor_cpu_float)).item()
+            has_inf = torch.any(torch.isinf(tensor_cpu_float)).item()
+            stats["has_nan"] = has_nan
+            stats["has_inf"] = has_inf
+
+            if not has_nan and not has_inf:
+                stats["max"] = f"{torch.max(tensor_cpu_float).item():.6f}"
+                stats["min"] = f"{torch.min(tensor_cpu_float).item():.6f}"
+                stats["mean"] = f"{torch.mean(tensor_cpu_float).item():.6f}"
+                stats["std"] = f"{torch.std(tensor_cpu_float).item():.6f}"
+            else:
+                stats["max"] = "NaN/Inf Present"
+                stats["min"] = "NaN/Inf Present"
+                stats["mean"] = "NaN/Inf Present"
+                stats["std"] = "NaN/Inf Present"
+
+            flat_data = tensor_cpu_float.flatten().numpy()[:5]
+            stats["first_5_values"] = flat_data
+        
+        print(f"\n--- [vLLM INTERNAL DEBUG] {name} ---\n{pprint.pformat(stats, indent=2)}\n--------------------------\n")
+# --- 结束新增 ---
+
 
 class MiniMaxText01RMSNormTP(CustomOp):
     name = "MiniMaxText01RMSNormTP"
@@ -56,6 +94,7 @@ class MiniMaxText01RMSNormTP(CustomOp):
 
         self.weight.weight_loader = self.weight_loader
         self.variance_epsilon = eps
+        self.prefix = "UnknownRMSNormTP"
         return
 
     @staticmethod
@@ -71,17 +110,45 @@ class MiniMaxText01RMSNormTP(CustomOp):
         param.data.copy_(loaded_weight[shard])
         return
 
-    def _forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    # def _forward(
+    #     self,
+    #     x: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     orig_dtype = x.dtype
+    #     x = x.to(torch.float32)
+    #     variance = x.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
+    #     if self.tp_world > 1:
+    #         variance = tensor_model_parallel_all_reduce(variance) / self.tp_world
+    #     x = x * torch.rsqrt(variance + self.variance_epsilon)
+    #     x = x.to(orig_dtype) * self.weight
+    #     return x
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        
+        # --- [修改] 在这里加入详细的对称日志 ---
+        print(f"--- [vLLM DEBUG] Entering RMSNormTP for '{self.prefix}' ---")
+        print_tensor_stats(x, f"RMSNorm_Input_{self.prefix}")
+
         orig_dtype = x.dtype
         x = x.to(torch.float32)
+
         variance = x.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
+        print_tensor_stats(variance, f"RMSNorm_Variance_Before_AllReduce_{self.prefix}")
+
         if self.tp_world > 1:
             variance = tensor_model_parallel_all_reduce(variance) / self.tp_world
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
+            print_tensor_stats(variance, f"RMSNorm_Variance_After_AllReduce_{self.prefix}")
+
+        # 与FD侧对齐，打印最终的 variance
+        print_tensor_stats(variance, f"RMSNorm_Variance_{self.prefix}")
+
+        inv_std = torch.rsqrt(variance + self.variance_epsilon)
+        print_tensor_stats(inv_std, f"RMSNorm_InvStd_{self.prefix}")
+        
+        x = x * inv_std
         x = x.to(orig_dtype) * self.weight
+
+        print(f"--- [vLLM DEBUG] Exiting RMSNormTP for '{self.prefix}' ---")
         return x
 
     def forward(
@@ -117,6 +184,8 @@ class MiniMaxText01LinearKernel:
         output, kv_history = lightning_attention(
             q, k, v, slope_rate, block_size=block_size, kv_history=kv_history
         )
+
+        print_tensor_stats(output, "VLLM_Lightning_Attention_Output")
         kv_caches.copy_(kv_history[:, :, -1, :, :].reshape(h, d, e))
         assert output.shape[0] == 1, "batch size must be 1"
         return rearrange(output.squeeze(0), "h n d -> n (h d)")
@@ -316,6 +385,8 @@ class MiniMaxText01LinearAttention(nn.Module, MambaBase):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
+        if self.layer_idx == 0: # 只打印第一层
+            print_tensor_stats(self.qkv_proj.weight, "VLLM_L0_QKV_PROJ_WEIGHT")
         if attn_metadata is not None:
             assert isinstance(attn_metadata, dict)
             attn_metadata = attn_metadata[self.prefix]
@@ -325,6 +396,38 @@ class MiniMaxText01LinearAttention(nn.Module, MambaBase):
             )
         else:
             num_actual_tokens = hidden_states.shape[0]
+            
+        # ========== [新增调试代码] ==========
+        if self.layer_idx == 0: # <--- 修正为 layer_idx
+            # hidden_states[:num_actual_tokens] 是即将进入 matmul 的输入
+            print_tensor_stats(hidden_states[:num_actual_tokens], f"VLLM_MATMUL_INPUT_L{self.layer_idx}")
+            # PyTorch的Linear层权重是 [out, in]，而 matmul(input, weight.T)
+            # 这里 ColumnParallelLinear 内部处理了，我们直接打印 weight 本身
+            print_tensor_stats(self.qkv_proj.weight, f"VLLM_MATMUL_WEIGHT_L{self.layer_idx}")
+        # ========== [结束新增] ==========
+        
+        # ========== [修改这里的调试代码] ==========
+        # 只在 rank 0 并且是第一次调用时执行保存操作
+        # 我们用一个简单的 flag 来防止重复保存
+        if self.layer_idx == 0 and not hasattr(self, '_weight_dumped'):
+            
+            # 打印信息，确认正在保存
+            if get_tensor_model_parallel_rank() == 0:
+                print(f"\n--- [vLLM DEBUG] Dumping L{self.layer_idx} QKV weight for rank 0... ---\n")
+            
+            # 获取最终加载到GPU上的权重参数
+            weight_shard = self.qkv_proj.weight 
+
+            # 保存到文件
+            # 注意：vLLM的权重布局是 [output_features, input_features]
+            if get_tensor_model_parallel_rank() == 0:
+                torch.save(weight_shard.cpu().float(), "vllm_qkv_weight_shard_rank0.pt")
+                print(f"\n--- [vLLM DEBUG] Saved rank 0 weight shard to vllm_qkv_weight_shard_rank0.pt ---\n")
+
+            # 设置 flag，防止重复保存
+            self._weight_dumped = True
+
+        # ========== [结束修改] ==========
 
         qkv, _ = self.qkv_proj(hidden_states[:num_actual_tokens])
         qkv32 = qkv.to(torch.float32)

@@ -54,6 +54,40 @@ from .interfaces import HasInnerState, IsHybrid
 from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers
 
 
+import pprint
+import numpy as np
+
+def print_tensor_stats(tensor, name):
+    """Prints statistics of a PyTorch tensor, mimicking the FD format."""
+    # Only print on rank 0 to avoid log spam
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+        
+    if tensor is None:
+        print(f"DEBUG_vLLM: {name} is None")
+        return
+    with torch.no_grad():
+        stats = {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+        # ========== [修改这里] ==========
+        num_elements = tensor.numel()
+        if num_elements > 0:
+            tensor_cpu_float = tensor.detach().cpu().to(torch.float32)
+            stats["max"] = f"{torch.max(tensor_cpu_float).item():.6f}"
+            stats["min"] = f"{torch.min(tensor_cpu_float).item():.6f}"
+            stats["mean"] = f"{torch.mean(tensor_cpu_float).item():.6f}"
+
+            # 只有当元素数量大于1时才计算std
+            if num_elements > 1:
+                stats["std"] = f"{torch.std(tensor_cpu_float).item():.6f}"
+            else:
+                stats["std"] = "0.000000" # 单个元素的std为0
+            # ========== [结束修改] ==========
+            flat_data = tensor_cpu_float.flatten().numpy()[:5]
+            stats["first_5_values"] = flat_data
+        
+        # Use pprint to format the dictionary nicely
+        print(f"\n--- [vLLM DEBUG] {name} ---\n{pprint.pformat(stats, indent=2)}\n----------------------------\n")
+
 def replace_weight_name(
     name: str, key: str = None, to: str = None, count: int = None, prefix: str = None
 ) -> str:
@@ -255,6 +289,80 @@ class MiniMaxText01Attention(nn.Module):
         )
         return
 
+    # def forward(
+    #     self,
+    #     hidden_states: torch.Tensor,
+    #     output: torch.Tensor,
+    #     positions: torch.Tensor,
+    #     **kwargs,
+    # ) -> None:
+    #     # ========== [开始新的 GQA 权重 Dump 代码] ==========
+    #     # 只 dump 一次
+    #     if not hasattr(self, '_gqa_weight_dumped'):
+            
+    #         # 只在 rank 0 上执行保存操作
+    #         if get_tensor_model_parallel_rank() == 0:
+    #             print(f"\n--- [vLLM DEBUG] Dumping GQA L{self.layer_idx} QKV weight for rank 0... ---\n")
+
+    #             # 获取最终加载到GPU上的权重参数
+    #             weight_shard = self.qkv_proj.weight 
+
+    #             # 保存到文件
+    #             torch.save(weight_shard.cpu().float(), f"vllm_gqa_l{self.layer_idx}_qkv_weight_shard_rank0.pt")
+    #             print(f"\n--- [vLLM DEBUG] Saved rank 0 weight shard to vllm_gqa_l{self.layer_idx}_qkv_weight_shard_rank0.pt ---\n")
+
+    #         # 在所有 rank 上都设置 flag
+    #         type(self)._gqa_weight_dumped = True
+    #     # ========== [结束 GQA 权重 Dump 代码] ==========
+        
+    #     qkv, _ = self.qkv_proj(hidden_states)
+    #     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+    #     print_tensor_stats(q, f"VLLM_L7_GQA_Q_BeforeRoPE")
+    #     print_tensor_stats(k, f"VLLM_L7_GQA_K_BeforeRoPE")
+    #     q, k = self.rotary_emb(positions, q, k)
+    #     print_tensor_stats(q, f"VLLM_L7_GQA_Q_AfterRoPE")
+    #     print_tensor_stats(k, f"VLLM_L7_GQA_K_AfterRoPE")
+    #     attn_output = self.attn(q, k, v)
+    #     print_tensor_stats(attn_output, f"VLLM_L7_GQA_Attention_Output")
+    #     output[:], _ = self.o_proj(attn_output)
+    
+    # def forward(
+    #     self,
+    #     hidden_states: torch.Tensor,
+    #     output: torch.Tensor,
+    #     positions: torch.Tensor,
+    #     **kwargs,
+    # ) -> None:
+    #     is_target_layer = (self.layer_idx == 7)
+
+    #     qkv, _ = self.qkv_proj(hidden_states)
+        
+    #     if is_target_layer:
+    #         print_tensor_stats(qkv, f"VLLM_L{self.layer_idx}_After_QKV_Proj_Combined")
+
+    #     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
+    #     if is_target_layer:
+    #         print_tensor_stats(q, f"VLLM_L{self.layer_idx}_Q_BeforeRoPE")
+    #         print_tensor_stats(k, f"VLLM_L{self.layer_idx}_K_BeforeRoPE")
+    #         print_tensor_stats(v, f"VLLM_L{self.layer_idx}_V_Tensor")
+
+    #     q, k = self.rotary_emb(positions, q, k)
+        
+    #     if is_target_layer:
+    #         print_tensor_stats(q, f"VLLM_L{self.layer_idx}_Q_AfterRoPE")
+    #         print_tensor_stats(k, f"VLLM_L{self.layer_idx}_K_AfterRoPE")
+        
+    #     # Note: The raw attention output is not easily accessible here as it's inside the 'self.attn' call
+    #     # self.attn is a vllm custom op which is a black box from this perspective.
+    #     # The final output after o_proj is what we can compare.
+    #     attn_output = self.attn(q, k, v)
+
+    #     if is_target_layer:
+    #         print_tensor_stats(attn_output, f"VLLM_L{self.layer_idx}_Attention_Kernel_Output")
+        
+    #     output[:], _ = self.o_proj(attn_output)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -262,11 +370,30 @@ class MiniMaxText01Attention(nn.Module):
         positions: torch.Tensor,
         **kwargs,
     ) -> None:
+        
         qkv, _ = self.qkv_proj(hidden_states)
+        
+        print_tensor_stats(qkv, f"VLLM_L{self.layer_idx}_After_QKV_Proj_Combined")
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
+        print_tensor_stats(q, f"VLLM_L{self.layer_idx}_Q_BeforeRoPE")
+        print_tensor_stats(k, f"VLLM_L{self.layer_idx}_K_BeforeRoPE")
+        print_tensor_stats(v, f"VLLM_L{self.layer_idx}_V_Tensor")
+
         q, k = self.rotary_emb(positions, q, k)
+        
+        print_tensor_stats(q, f"VLLM_L{self.layer_idx}_Q_AfterRoPE")
+        print_tensor_stats(k, f"VLLM_L{self.layer_idx}_K_AfterRoPE")
+        
         attn_output = self.attn(q, k, v)
+
+        print_tensor_stats(attn_output, f"VLLM_L{self.layer_idx}_Attention_Kernel_Output")
+        
+        # o_proj's output is the final output of the attention block
         output[:], _ = self.o_proj(attn_output)
+
+
 
 
 class MiniMaxText01DecoderLayer(nn.Module):
@@ -423,6 +550,186 @@ class MiniMaxText01DecoderLayer(nn.Module):
             self.shared_moe_mode = getattr(config, "shared_moe_mode", "softmax")
         return
 
+    # def forward(
+    #     self,
+    #     hidden_states: torch.Tensor,
+    #     positions: torch.Tensor,
+    #     attn_metadata: AttentionMetadata,
+    #     residual: Optional[torch.Tensor],
+    #     is_warmup: bool = False,
+    #     **kwargs,
+    # ) -> tuple[torch.Tensor, torch.Tensor]:
+    #     # --- Start of FD Aligned Debug Prints ---
+    #     layer_id = self._ilayer
+    #     print(f"\n{'='*20} [vLLM DEBUG] Entering DecoderLayer {layer_id} {'='*20}")
+    #     print_tensor_stats(hidden_states, f"L{layer_id}:0a_Input_HiddenStates")
+    #     print_tensor_stats(residual, f"L{layer_id}:0b_Input_Residual")
+    #     # --- End of Debug Prints ---
+
+    #     layernorm_input = hidden_states
+    #     layernorm_output = self.input_layernorm(layernorm_input)
+        
+    #     # --- Debug Print ---
+    #     print_tensor_stats(layernorm_output, f"L{layer_id}:1_After_InputLayernorm")
+    #     # --- End of Debug Prints ---
+
+    #     residual_attn = layernorm_output if self.postnorm else layernorm_input
+        
+    #     # self.self_attn is a custom op that calls MiniMaxText01LinearAttention._forward
+    #     # So, the prints for LinearAttention will be inside that class.
+    #     self_attention_output = torch.empty_like(layernorm_output)
+    #     self.self_attn(
+    #         hidden_states=layernorm_output,
+    #         output=self_attention_output,
+    #         positions=positions,
+    #     )
+        
+    #     # --- Debug Print ---
+    #     print_tensor_stats(self_attention_output, f"L{layer_id}:2_After_Attention")
+    #     # --- End of Debug Prints ---
+        
+    #     hidden_states_after_attn = (residual_attn * self.layernorm_attention_alpha) + (self_attention_output * self.layernorm_attention_beta)
+        
+    #     # --- Debug Print ---
+    #     print_tensor_stats(hidden_states_after_attn, f"L{layer_id}:3_After_Attn_Residual(alpha={self.layernorm_attention_alpha}, beta={self.layernorm_attention_beta})")
+    #     # --- End of Debug Prints ---
+
+    #     layernorm_input = hidden_states_after_attn
+    #     layernorm_output_mlp = self.post_attention_layernorm(layernorm_input)
+        
+    #     # --- Debug Print ---
+    #     print_tensor_stats(layernorm_output_mlp, f"L{layer_id}:4_After_PostAttnLayernorm")
+    #     # --- End of Debug Prints ---
+        
+    #     residual_mlp = layernorm_output_mlp if self.postnorm else layernorm_input
+
+    #     if self.expert_num == 1:
+    #         mlp_output = self.mlp(layernorm_output_mlp)
+    #     else:
+    #         moe_layernorm_output = layernorm_output_mlp.clone()
+    #         mlp_output = self.block_sparse_moe(moe_layernorm_output)
+    #         if self.shared_moe:
+    #             # This part is complex, let's add prints inside if needed later
+    #             before_moe_dtype = layernorm_output_mlp.dtype
+    #             moe_hidden_fp32 = mlp_output.to(torch.float32)
+    #             output_mlp_shared = self.shared_mlp(layernorm_output_mlp).to(torch.float32)
+
+    #             coef, _ = self.coefficient(layernorm_output_mlp.to(torch.float32))
+
+    #             if self.shared_moe_mode == "softmax":
+    #                 coef = torch.nn.functional.softmax(coef, dim=-1)
+    #                 mlp_output = moe_hidden_fp32 * (1 - coef) + output_mlp_shared * coef
+    #             elif self.shared_moe_mode == "sigmoid":
+    #                 coef = torch.nn.functional.sigmoid(coef)
+    #                 mlp_output = moe_hidden_fp32 * (1 - coef) + output_mlp_shared * coef
+
+    #             mlp_output = mlp_output.to(before_moe_dtype)
+        
+    #     # --- Debug Print ---
+    #     print_tensor_stats(mlp_output, f"L{layer_id}:5a_After_MoE_MLP")
+    #     if self.shared_moe:
+    #          print_tensor_stats(mlp_output, f"L{layer_id}:5b_After_Shared_MLP_Merge")
+    #     # --- End of Debug Prints ---
+
+    #     final_output = (residual_mlp * self.layernorm_mlp_alpha) + (mlp_output * self.layernorm_mlp_beta)
+        
+    #     # --- Debug Print ---
+    #     print_tensor_stats(final_output, f"L{layer_id}:6_FinalOutput(alpha={self.layernorm_mlp_alpha}, beta={self.layernorm_mlp_beta})")
+    #     print(f"{'='*20} [vLLM DEBUG] Exiting DecoderLayer {layer_id} {'='*20}\n")
+    #     # --- End of Debug Prints ---
+
+    #     return final_output, None
+    
+    
+    # def forward(
+    #     self,
+    #     hidden_states: torch.Tensor,
+    #     positions: torch.Tensor,
+    #     attn_metadata: AttentionMetadata,
+    #     residual: Optional[torch.Tensor],
+    #     is_warmup: bool = False,
+    #     **kwargs,
+    # ) -> tuple[torch.Tensor, torch.Tensor]:
+    #     layer_id = self._ilayer
+    #     # We only focus on GQA Layer 7
+    #     is_target_layer = (layer_id == 7)
+
+    #     if is_target_layer:
+    #         print(f"\n{'='*20} [vLLM GQA DEBUG] Entering DecoderLayer {layer_id} {'='*20}")
+    #         print_tensor_stats(hidden_states, f"VLLM_L{layer_id}:0a_Input_HiddenStates")
+
+    #     layernorm_input = hidden_states
+    #     layernorm_output = self.input_layernorm(layernorm_input)
+        
+    #     if is_target_layer:
+    #         print_tensor_stats(layernorm_output, f"VLLM_L{layer_id}:1_After_InputLayernorm")
+
+    #     residual_attn = layernorm_output if self.postnorm else layernorm_input
+        
+    #     self_attention_output = torch.empty_like(layernorm_output)
+    #     # self.self_attn (MiniMaxText01Attention.forward) will handle its internal prints
+    #     self.self_attn(
+    #         hidden_states=layernorm_output,
+    #         output=self_attention_output,
+    #         positions=positions,
+    #     )
+        
+    #     if is_target_layer:
+    #         print_tensor_stats(self_attention_output, f"VLLM_L{layer_id}:2_After_Attention")
+        
+    #     hidden_states_after_attn = (residual_attn * self.layernorm_attention_alpha) + (self_attention_output * self.layernorm_attention_beta)
+        
+    #     if is_target_layer:
+    #         print_tensor_stats(hidden_states_after_attn, f"VLLM_L{layer_id}:3_After_Attn_Residual")
+
+    #     layernorm_input = hidden_states_after_attn
+    #     layernorm_output_mlp = self.post_attention_layernorm(layernorm_input)
+        
+    #     # --- Debug Print ---
+    #     print_tensor_stats(layernorm_output_mlp, f"L{layer_id}:4_After_PostAttnLayernorm")
+    #     # --- End of Debug Prints ---
+        
+    #     residual_mlp = layernorm_output_mlp if self.postnorm else layernorm_input
+
+    #     if self.expert_num == 1:
+    #         mlp_output = self.mlp(layernorm_output_mlp)
+    #     else:
+    #         moe_layernorm_output = layernorm_output_mlp.clone()
+    #         mlp_output = self.block_sparse_moe(moe_layernorm_output)
+    #         if self.shared_moe:
+    #             # This part is complex, let's add prints inside if needed later
+    #             before_moe_dtype = layernorm_output_mlp.dtype
+    #             moe_hidden_fp32 = mlp_output.to(torch.float32)
+    #             output_mlp_shared = self.shared_mlp(layernorm_output_mlp).to(torch.float32)
+
+    #             coef, _ = self.coefficient(layernorm_output_mlp.to(torch.float32))
+
+    #             if self.shared_moe_mode == "softmax":
+    #                 coef = torch.nn.functional.softmax(coef, dim=-1)
+    #                 mlp_output = moe_hidden_fp32 * (1 - coef) + output_mlp_shared * coef
+    #             elif self.shared_moe_mode == "sigmoid":
+    #                 coef = torch.nn.functional.sigmoid(coef)
+    #                 mlp_output = moe_hidden_fp32 * (1 - coef) + output_mlp_shared * coef
+
+    #             mlp_output = mlp_output.to(before_moe_dtype)
+        
+    #     # --- Debug Print ---
+    #     print_tensor_stats(mlp_output, f"L{layer_id}:5a_After_MoE_MLP")
+    #     if self.shared_moe:
+    #          print_tensor_stats(mlp_output, f"L{layer_id}:5b_After_Shared_MLP_Merge")
+    #     # --- End of Debug Prints ---
+
+    #     final_output = (residual_mlp * self.layernorm_mlp_alpha) + (mlp_output * self.layernorm_mlp_beta)
+        
+    #     # --- Debug Print ---
+    #     print_tensor_stats(final_output, f"L{layer_id}:6_FinalOutput(alpha={self.layernorm_mlp_alpha}, beta={self.layernorm_mlp_beta})")
+    #     print(f"{'='*20} [vLLM DEBUG] Exiting DecoderLayer {layer_id} {'='*20}\n")
+    #     # --- End of Debug Prints ---
+
+    #     return final_output, None
+    
+    # in work/vllm/vllm/model_executor/models/minimax_text_01.py
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -432,53 +739,72 @@ class MiniMaxText01DecoderLayer(nn.Module):
         is_warmup: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        layer_id = self._ilayer
+        
+        attn_type_str = "GQA" if self.self_attn.__class__.__name__ == 'MiniMaxText01Attention' else "LinearAttn"
+        
+        print(f"\n{'='*20} [vLLM DEBUG] Entering DecoderLayer {layer_id} ({attn_type_str}) {'='*20}")
+        print_tensor_stats(hidden_states, f"VLLM_L{layer_id}:0a_Input_HiddenStates")
+
         layernorm_input = hidden_states
         layernorm_output = self.input_layernorm(layernorm_input)
-        residual = layernorm_output if self.postnorm else layernorm_input
+        
+        print_tensor_stats(layernorm_output, f"VLLM_L{layer_id}:1_After_InputLayernorm")
+
+        residual_attn = layernorm_output if self.postnorm else layernorm_input
+        
         self_attention_output = torch.empty_like(layernorm_output)
+        # self.self_attn (Attention/LinearAttention) will handle its internal prints
         self.self_attn(
             hidden_states=layernorm_output,
             output=self_attention_output,
             positions=positions,
         )
+        
+        print_tensor_stats(self_attention_output, f"VLLM_L{layer_id}:2_After_Attention")
+        
+        hidden_states_after_attn = (residual_attn * self.layernorm_attention_alpha) + (self_attention_output * self.layernorm_attention_beta)
+        
+        print_tensor_stats(hidden_states_after_attn, f"VLLM_L{layer_id}:3_After_Attn_Residual")
 
-        residual = residual * self.layernorm_attention_alpha
-        self_attention_output = self_attention_output * self.layernorm_attention_beta
+        # --- MLP Block ---
+        layernorm_input = hidden_states_after_attn
+        layernorm_output_mlp = self.post_attention_layernorm(layernorm_input)
+        
+        print_tensor_stats(layernorm_output_mlp, f"VLLM_L{layer_id}:4_After_PostAttnLayernorm")
 
-        layernorm_input = residual + self_attention_output
-        layernorm_output = self.post_attention_layernorm(layernorm_input)
-        residual = layernorm_output if self.postnorm else layernorm_input
+        residual_mlp = layernorm_output_mlp if self.postnorm else layernorm_input
 
         if self.expert_num == 1:
-            hidden_states = self.mlp(layernorm_output)
-        else:
-            moe_layernorm_output = layernorm_output.clone()
-            moe_hidden_states = self.block_sparse_moe(moe_layernorm_output)
+            mlp_output = self.mlp(layernorm_output_mlp)
+        else: # MoE logic
+            moe_layernorm_output = layernorm_output_mlp.clone()
+            mlp_output = self.block_sparse_moe(moe_layernorm_output)
             if self.shared_moe:
-                before_moe_dtype = layernorm_output.dtype
-                moe_hidden_fp32 = moe_hidden_states.to(torch.float32)
-                output_mlp = self.shared_mlp(layernorm_output).to(torch.float32)
-
-                coef, _ = self.coefficient(layernorm_output.to(torch.float32))
-
-                if self.shared_moe_mode == "softmax":
-                    coef = torch.nn.functional.softmax(coef, dim=-1)
-                    hidden_states = moe_hidden_fp32 * (1 - coef) + output_mlp * coef
-                elif self.shared_moe_mode == "sigmoid":
+                before_moe_dtype = layernorm_output_mlp.dtype
+                moe_hidden_fp32 = mlp_output.to(torch.float32)
+                output_mlp_shared = self.shared_mlp(layernorm_output_mlp).to(torch.float32)
+                coef, _ = self.coefficient(layernorm_output_mlp.to(torch.float32))
+                if self.shared_moe_mode == "sigmoid":
                     coef = torch.nn.functional.sigmoid(coef)
-                    hidden_states = moe_hidden_fp32 * (1 - coef) + output_mlp * coef
+                else: # softmax
+                    coef = torch.nn.functional.softmax(coef, dim=-1)
+                mlp_output = moe_hidden_fp32 * (1 - coef) + output_mlp_shared * coef
+                mlp_output = mlp_output.to(before_moe_dtype)
+        
+        print_tensor_stats(mlp_output, f"VLLM_L{layer_id}:5a_After_MoE_MLP")
+        if self.shared_moe:
+             print_tensor_stats(mlp_output, f"VLLM_L{layer_id}:5b_After_Shared_MLP_Merge")
 
-                hidden_states = hidden_states.to(before_moe_dtype)
-            else:
-                hidden_states = moe_hidden_states
+        # --- Final Residual Connection ---
+        final_output = (residual_mlp * self.layernorm_mlp_alpha) + (mlp_output * self.layernorm_mlp_beta)
+        
+        print_tensor_stats(final_output, f"VLLM_L{layer_id}:6_FinalOutput")
+        print(f"{'='*20} [vLLM DEBUG] Exiting DecoderLayer {layer_id} ({attn_type_str}) {'='*20}\n")
 
-        residual = residual * self.layernorm_mlp_alpha
-        hidden_states = hidden_states * self.layernorm_mlp_beta
-
-        hidden_states = residual + hidden_states
-
-        return hidden_states, None
-
+        return final_output, None
+    
+    
     @staticmethod
     def shared_moe_coefficient_loader(
         param: torch.Tensor, loaded_weight: torch.Tensor
@@ -633,14 +959,30 @@ class MiniMaxText01Model(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        # forward_context = get_forward_context()
+        # ==================== 区分 Profile 和 正式推理 ====================
         forward_context = get_forward_context()
+        is_profile_run = forward_context.attn_metadata is None
+        run_mode = "[PROFILE]" if is_profile_run else "[INFERENCE]"
+        
+        if get_tensor_model_parallel_rank() == 0:
+            print(f"\n{'#'*20} vLLM RUN MODE: {run_mode} {'#'*20}\n")
+        # =================================================================
         attn_metadata = forward_context.attn_metadata
 
         if get_pp_group().is_first_rank:
             if inputs_embeds is None:
+                # --- Debug Print ---
+                print_tensor_stats(input_ids, "TOP:0_InputIDs")
+                # --- End of Debug Prints ---
                 hidden_states = self.embed_scale * self.embed_tokens(input_ids)
             else:
                 hidden_states = inputs_embeds
+            
+            # --- Debug Print ---
+            print_tensor_stats(hidden_states, "TOP:1_AfterEmbedding")
+            # --- End of Debug Prints ---
+            
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -658,12 +1000,22 @@ class MiniMaxText01Model(nn.Module):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+        
+        # The final norm happens after the loop.
+        # FD does it before the final output, vLLM does it here.
         if residual is not None:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            # This path is unlikely for this model architecture
+            hidden_states_normed, _ = self.norm(hidden_states, residual)
         else:
-            hidden_states = self.norm(hidden_states)
+            hidden_states_normed = self.norm(hidden_states)
+        
+        # --- Debug Print ---
+        # Note: FD calls this "TOP:3_FinalOutput", which corresponds to the output
+        # of the final norm before the lm_head.
+        print_tensor_stats(hidden_states_normed, "TOP:3_FinalOutput")
+        # --- End of Debug Prints ---
 
-        return hidden_states
+        return hidden_states_normed
 
 
 class MiniMaxText01ForCausalLM(nn.Module, HasInnerState, IsHybrid):
@@ -956,6 +1308,39 @@ class MiniMaxText01ForCausalLM(nn.Module, HasInnerState, IsHybrid):
             return
 
         for name, loaded_weight in weights:
+            if "layers.0.self_attn.qkv_proj.weight" in name:
+                tp_rank = get_tensor_model_parallel_rank()
+                if tp_rank == 0:
+                    print("\n" + "="*20 + " VLLM RAW WEIGHT DEBUG " + "="*20)
+                    
+                    # 1. 打印原始加载的全量权重
+                    full_weight_flat = loaded_weight.detach().cpu().to(torch.float32).flatten().numpy()
+                    print("VLLM RAW FULL weight, first 20:", full_weight_flat[:20])
+                    
+                    # 2. 找到 rank=0 对应的参数，并打印最终加载到参数里的值
+                    # 注意: `self.model` 指向 MiniMaxText01ForCausalLM 实例
+                    # param_rank0 = self.model.model.layers[0].self_attn.qkv_proj.weight
+                    param_rank0 = self.model.layers[0].self_attn.qkv_proj.weight
+                    final_shard_flat = param_rank0.detach().cpu().to(torch.float32).flatten().numpy()
+                    print("VLLM FINAL SHARD (rank 0), first 20:", final_shard_flat[:20])
+                    
+                    print("="*20 + " END VLLM DEBUG " + "="*20 + "\n")
+            
+            
+            if "layers.0.self_attn.qkv_proj.weight" in name:
+                print("!!! VLLM RAW LOADED QKV WEIGHT !!!")
+                print("Shape:", loaded_weight.shape)
+                
+                # --- 核心修复 ---
+                # 先将 bfloat16 转换为 float32，然后再进行后续操作
+                loaded_weight_float32 = loaded_weight.to(torch.float32)
+                # --- 结束修复 ---
+
+                # 现在对 float32 版本的 tensor 进行操作
+                print("First 5 values:", loaded_weight_float32.flatten().cpu().numpy()[:5])
+                print("Min:", loaded_weight_float32.min().item())
+                print("Mean:", loaded_weight_float32.mean().item())
+                print("Std:", loaded_weight_float32.std().item()) # 最好也加上 std
             weight_at_layer = which_layer(name)
             if weight_at_layer and weight_at_layer >= len(
                 self.model.decoder_attention_types

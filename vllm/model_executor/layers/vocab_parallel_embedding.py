@@ -29,6 +29,35 @@ from vllm.platforms import current_platform
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
 
+import pprint
+import numpy as np
+
+def print_tensor_stats(tensor, name):
+    """Prints statistics of a PyTorch tensor, mimicking the FD format."""
+    # Only print on rank 0 to avoid log spam
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+        
+    if tensor is None:
+        print(f"DEBUG_vLLM: {name} is None")
+        return
+    with torch.no_grad():
+        stats = {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+        if tensor.numel() > 0:
+            tensor_cpu_float = tensor.detach().cpu().to(torch.float32)
+            stats["max"] = f"{torch.max(tensor_cpu_float).item():.6f}"
+            stats["min"] = f"{torch.min(tensor_cpu_float).item():.6f}"
+            stats["mean"] = f"{torch.mean(tensor_cpu_float).item():.6f}"
+            stats["std"] = f"{torch.std(tensor_cpu_float).item():.6f}"
+            
+            # if tensor_cpu_float.dim() >= 2:
+            #     flat_data = tensor_cpu_float.numpy()[0, :5]
+            # else:
+            flat_data = tensor_cpu_float.flatten().numpy()[:5]
+            stats["first_5_values"] = flat_data
+        
+        print(f"\n--- [vLLM DEBUG] {name} ---\n{pprint.pformat(stats, indent=2)}\n----------------------------\n")
+
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
@@ -460,8 +489,30 @@ class VocabParallelEmbedding(CustomOp):
         param[loaded_weight.shape[0] :].data.fill_(0)
 
     def forward_native(self, input_):
+        # Only print on rank 0 to avoid log spam
+        if get_tensor_model_parallel_rank() == 0:
+            print("\n--- [vLLM DEBUG] VocabParallelEmbedding.forward_native ---")
+            
+            # Print first 10 input token IDs
+            print(f"Input IDs (first 10): {input_[:10].tolist()}")
+            
+            # Check a specific token ID (e.g., token 5)
+            test_token_id = 5
+            # Find its corresponding local index in the sharded weight matrix
+            start_idx = self.shard_indices.org_vocab_start_index
+            end_idx = self.shard_indices.org_vocab_end_index
+            
+            if self.tp_size == 1 or (test_token_id >= start_idx and test_token_id < end_idx):
+                local_idx = test_token_id - start_idx
+                if local_idx < self.weight.shape[0]:
+                    weight_vector = self.weight[local_idx, :5].detach().cpu().to(torch.float32).numpy()
+                    print(f"Weight for token ID {test_token_id} (local index {local_idx}), first 5 values: {weight_vector}")
+            
+            print_tensor_stats(input_, "Input IDs")
+            print_tensor_stats(self.weight, "Embedding Weight")
+        
+        # Original forward logic
         if self.tp_size > 1:
-            # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
                 input_,
                 self.shard_indices.org_vocab_start_index,
@@ -472,13 +523,22 @@ class VocabParallelEmbedding(CustomOp):
             )
         else:
             masked_input = input_
-        # Get the embeddings.
+            
         output_parallel = self.quant_method.embedding(self, masked_input.long())
-        # Mask the output embedding.
+        
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        # Reduce across all the model parallel GPUs.
+            
         output = tensor_model_parallel_all_reduce(output_parallel)
+        
+        if get_tensor_model_parallel_rank() == 0:
+            # Print the embedding output for the first token
+            first_token_output = output[0, :5].detach().cpu().to(torch.float32).numpy()
+            print(f"Output embedding for first token (ID: {input_[0].item()}), first 5 values: {first_token_output}")
+            
+            print_tensor_stats(output, "Output Embeddings")
+            print("--- [vLLM DEBUG] Exiting VocabParallelEmbedding.forward_native ---\n")
+            
         return output
 
     def forward_cuda(self, input_):

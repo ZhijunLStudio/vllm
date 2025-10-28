@@ -8,6 +8,46 @@ from einops import rearrange
 from vllm.triton_utils import tl, triton
 
 
+
+import pprint
+import numpy as np
+
+def print_tensor_stats(tensor, name):
+    """Prints statistics of a PyTorch tensor, mimicking the FD format."""
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+        
+    if tensor is None:
+        print(f"DEBUG_vLLM_OPS: {name} is None")
+        return
+    with torch.no_grad():
+        stats = {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+        if tensor.numel() > 0:
+            tensor_cpu_float = tensor.detach().cpu().to(torch.float32)
+
+            has_nan = torch.any(torch.isnan(tensor_cpu_float)).item()
+            has_inf = torch.any(torch.isinf(tensor_cpu_float)).item()
+            stats["has_nan"] = has_nan
+            stats["has_inf"] = has_inf
+
+            if not has_nan and not has_inf:
+                stats["max"] = f"{torch.max(tensor_cpu_float).item():.6f}"
+                stats["min"] = f"{torch.min(tensor_cpu_float).item():.6f}"
+                stats["mean"] = f"{torch.mean(tensor_cpu_float).item():.6f}"
+                stats["std"] = f"{torch.std(tensor_cpu_float).item():.6f}"
+            else:
+                stats["max"] = "NaN/Inf Present"
+                stats["min"] = "NaN/Inf Present"
+                stats["mean"] = "NaN/Inf Present"
+                stats["std"] = "NaN/Inf Present"
+            
+            # if tensor_cpu_float.dim() >= 2:
+            #     flat_data = tensor_cpu_float.numpy()[0, :5]
+            # else:
+            flat_data = tensor_cpu_float.flatten().numpy()[:5]
+            stats["first_5_values"] = flat_data
+        print(f"\n--- [vLLM OPS DEBUG] {name} ---\n{pprint.pformat(stats, indent=2)}\n--------------------------\n")
+
 @triton.jit
 def _fwd_diag_kernel(
     Q,
@@ -441,6 +481,7 @@ class _attention(torch.autograd.Function):
             NUM_BLOCK=NUM_BLOCK,
             CBLOCK=CBLOCK,
         )
+        print_tensor_stats(o, "PyLayer_After_DiagKernel") # vLLM侧打印
 
         # Set feature block sizes
         NUM_FBLOCK = 1
@@ -474,10 +515,12 @@ class _attention(torch.autograd.Function):
             CBLOCK=CBLOCK,
             NUM_CBLOCK=NUM_CBLOCK,
         )
+        print_tensor_stats(kv, "PyLayer_After_KVParallelKernel") # vLLM侧打印
 
         # Step 3: Reduce key-value outer products
         # across blocks and update KV history
         grid = (b * h, NUM_FBLOCK)
+        print_tensor_stats(kv_history, "PyLayer_Before_KVReduceKernel_History") # vLLM侧打印
         _fwd_kv_reduce[grid](
             s,
             kv,
@@ -492,6 +535,9 @@ class _attention(torch.autograd.Function):
             D_FBLOCK=D_FBLOCK,
             E_FBLOCK=E_FBLOCK,
         )
+        print_tensor_stats(kv, "PyLayer_After_KVReduceKernel_KV") # vLLM侧打印
+        print_tensor_stats(kv_history, "PyLayer_After_KVReduceKernel_History") # vLLM侧打印
+
 
         # Step 4: Compute non-diagonal blocks of attention
         grid = (b * h, NUM_BLOCK * NUM_CBLOCK)
@@ -511,6 +557,7 @@ class _attention(torch.autograd.Function):
             CBLOCK=CBLOCK,
             NUM_CBLOCK=NUM_CBLOCK,
         )
+        print_tensor_stats(o, "PyLayer_After_NoneDiagKernel") # vLLM侧打印
 
         # Save tensors for backward pass
         ctx.save_for_backward(q, k, v, s, kv)
@@ -531,22 +578,13 @@ def lightning_attention(
     block_size: int = 256,
     kv_history: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply lightning attention algorithm
-    to compute attention efficiently.
-
-    Args:
-        q: Query tensor of shape [batch, heads, seq_len, dim]
-        k: Key tensor of shape [batch, heads, seq_len, dim]
-        v: Value tensor of shape [batch, heads, seq_len, dim_v]
-        ed: Decay rate tensor of shape [heads]
-        block_size: Size of blocks for block-sparse attention
-        kv_history: Optional key-value history from previous computations
-
-    Returns:
-        output: Attention output
-        kv: Updated key-value history
-    """
+    
+    # ==================== Symmetrical Debug Prints ====================
+    print_tensor_stats(q, "Kernel_Wrapper_Input_Q")
+    print_tensor_stats(k, "Kernel_Wrapper_Input_K")
+    print_tensor_stats(v, "Kernel_Wrapper_Input_V")
+    # =================================================================
+    
     d = q.shape[-1]
     e = v.shape[-1]
 
@@ -559,26 +597,57 @@ def lightning_attention(
     arr = [m * i for i in range(d // m + 1)]
     if arr[-1] != d:
         arr.append(d)
-    n = len(arr)
+    
+    num_chunks = len(arr) - 1
     output = 0
 
     # Initialize or clone key-value history
     if kv_history is None:
-        kv_history = torch.zeros(
+        kv_history_for_loop = torch.zeros(
             (q.shape[0], q.shape[1], d, e), dtype=torch.float32, device=q.device
         )
     else:
-        kv_history = kv_history.clone().contiguous()
+        kv_history_for_loop = kv_history.clone().contiguous()
 
+    if torch.distributed.get_rank() == 0:
+        print(f">>> [DEBUG] Starting chunked attention computation. Total chunks: {num_chunks}")
+        
+    final_kv = None
     # Process each chunk and accumulate results
-    for i in range(n - 1):
+    for i in range(num_chunks):
         s = arr[i]
-        e = arr[i + 1]
-        q1 = q[..., s:e]
-        k1 = k[..., s:e]
-        o, kv = lightning_attention_(q1, k1, v, ed, kv_history)
+        e_chunk = arr[i + 1]
+        q1 = q[..., s:e_chunk]
+        k1 = k[..., s:e_chunk]
+        
+        # For vLLM, the autograd function expects the full kv_history shape
+        # We need to ensure the underlying kernel can handle the sliced Q/K
+        # The original implementation seems to handle this correctly.
+        
+        # ==================== Symmetrical Debug Prints ====================
+        if torch.distributed.get_rank() == 0:
+            print(f">>> [DEBUG] Processing chunk {i}: head_dim slice [{s}:{e_chunk}]")
+        print_tensor_stats(q1, f"Kernel_Chunk_{i}_Input_Q")
+        print_tensor_stats(k1, f"Kernel_Chunk_{i}_Input_K")
+        # In vLLM, lightning_attention_ takes the full kv_history and internally the kernels might be aware of the sliced Q/K.
+        # Let's pass the full one to be consistent with original vLLM logic.
+        print_tensor_stats(kv_history_for_loop, f"Kernel_Chunk_{i}_Input_KV_History")
+        # =================================================================
+        
+        # Here we assume lightning_attention_ correctly handles the sliced q1, k1 with full kv_history
+        o, kv = lightning_attention_(q1, k1, v, ed, kv_history_for_loop)
+        
+        print_tensor_stats(o, f"Kernel_Chunk_{i}_Output_O")
+        
         output = output + o
-    return output, kv
+        
+        # In vLLM's original code, `kv` is the full updated state, so we update the loop variable
+        kv_history_for_loop = kv.clone().contiguous()
+        final_kv = kv
+        
+    print_tensor_stats(output, "Kernel_Final_Aggregated_Output_O")
+    
+    return output, final_kv
 
 
 @triton.jit
